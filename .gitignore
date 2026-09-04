@@ -1,2 +1,18 @@
 # testing folder
 testing/*
+
+# cache files
+data/cache/*
+
+# mlflow
+mlruns/*
+
+# mlflow db
+mlflow.db
+
+# venv
+.venv/
+
+# __pycache__
+__pycache__/
+mcp_servers/data_understanding_server/__pycache__/
