@@ -35,11 +35,20 @@ from sklearn.feature_selection import mutual_info_classif, mutual_info_regressio
 from sklearn.preprocessing import LabelEncoder
 
 from cache import (
-    get_cache_dir,
     compute_handle_id,
     save_object,
     load_object,
     object_exists,
+)
+
+from stats import(
+    test_normality,
+    compute_kurtosis,
+    spearman_correlation,
+    cramers_v,
+    anova_f_eta_squared,
+    mutual_information,
+    auto_select_association_method
 )
 
 
@@ -158,9 +167,10 @@ def profile_dataset(dataset_id: str, depth: str = "full") -> dict:
                 "skew": _safe_float(col_data.skew()),
             })
             if depth == "full":
-                col_profile["kurtosis"] = _safe_float(col_data.kurt())
+                col_profile["kurtosis"] = compute_kurtosis(col_data)
                 if len(non_null) >= 8:
-                    stat, p = stats.normaltest(non_null)
+                    is_norm, stat, p = test_normality(col_data)
+                    col_profile["is_normal"] = is_norm
                     col_profile["normality_stat"] = _safe_float(stat)
                     col_profile["normality_p_value"] = _safe_float(p)
                 else:
@@ -344,148 +354,42 @@ def detect_target_leakage(dataset_id: str, target_column: str, outcome_time_colu
     return {col: target.corr(df[col]) for col in df.columns}
 
 
-def measure_associations(dataset_id: str, method: str = "auto", columns: Optional[list[str]] = None) -> dict:
-    """Pairwise association matrix over `columns` (default: all columns
-    in the dataset). method='auto' is currently the only supported
-    value; anything else raises ValueError.
-
-    Per unordered pair, 'auto' picks:
-      - Spearman rank correlation, for numeric-numeric pairs
-      - Cramer's V (via a chi-square test of independence), for
-        categorical-categorical pairs
-      - ANOVA F-statistic (numeric grouped by categorical levels), for
-        mixed numeric-categorical pairs
-    A column counts as categorical if its dtype is object, category, or
-    bool; datetime columns are not supported and are skipped.
-
-    Whenever the primary method is on a 0-1 correlation scale (spearman
-    or cramers_v -- not anova_f, which isn't bounded that way) and its
-    magnitude is below 0.1, the pair is escalated to mutual information
-    (sklearn's mutual_info_regression/mutual_info_classif) as a
-    non-linear-aware fallback. Escalation never overrides the primary
-    value; both are reported.
-
-    columns restricts which pairs get computed, for speed on wide
-    datasets. Pairs involving a constant column, a column with fewer
-    than 2 non-null values, or fewer than 2 overlapping non-null rows
-    after aligning the pair, are skipped (with a reason) rather than
-    guessed at.
-
-    Returns:
-        {
-          "pairs": {
-            "colA|colB": {
-              "method": "spearman" | "cramers_v" | "anova_f",
-              "value": float,
-              "p_value": float,
-              "escalated": bool,
-              "mutual_info": float | None,  # set only if escalated
-            }, ...
-          },
-          "multicollinearity_flags": [[colA, colB, spearman_value], ...],
-              # numeric-numeric pairs with |spearman| > 0.85
-          "skipped": {"colX" or "colA|colB": "reason", ...},
-        }
+def measure_associations(x: pd.Series, y: pd.Series, x_role: str, y_role: str,
+                          method: str = "auto", weak_threshold: float = 0.1) -> dict:
+    """Computes an association statistic between two columns. If method='auto',
+    picks the method via auto_select_association_method based on (x_role, y_role).
+    If the primary statistic's effect size is below weak_threshold, escalates to
+    mutual_information, since Spearman/Cramer's V/ANOVA-F only catch monotonic,
+    categorical-association, or mean-shift relationships respectively. Returns a
+    dict with the method(s) used, their scores, and whether MI escalation fired.
     """
-    if method != "auto":
-        raise ValueError(f"Unsupported method: {method!r}. Only 'auto' is implemented.")
+    if method == "auto":
+        method = auto_select_association_method(x_role, y_role)
 
-    df = load_object("datasets", dataset_id)
-    columns = list(columns) if columns is not None else list(df.columns)
-    for col in columns:
-        if col not in df.columns:
-            raise ValueError(f"Column '{col}' not found in dataset.")
+    result = {"method": method}
 
-    WEAK_THRESHOLD = 0.1
-    MULTICOLLINEARITY_THRESHOLD = 0.85
+    if method == "spearman":
+        corr = spearman_correlation(x, y)
+        result["rho"] = corr["rho"]
+        result["p_value"] = corr["p_value"]
+        strength = abs(corr["rho"])
+    elif method == "cramers_v":
+        v = cramers_v(x, y)
+        result["cramers_v"] = v
+        strength = v
+    elif method == "anova":
+        categorical, numeric = (x, y) if x_role == "categorical" else (y, x)
+        anova = anova_f_eta_squared(categorical, numeric)
+        result.update(anova)
+        strength = np.sqrt(anova["eta_squared"]) if not np.isnan(anova["eta_squared"]) else 0.0
+    else:
+        raise ValueError(f"Unknown method: {method}")
 
-    def is_categorical(s):
-        return (
-            s.dtype == object
-            or isinstance(s.dtype, pd.CategoricalDtype)
-            or pd.api.types.is_bool_dtype(s)
-        )
+    result["strength"] = strength
+    result["escalated_to_mi"] = False
 
-    skipped = {}
-    usable = []
-    for col in columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            skipped[col] = "datetime columns not supported"
-        elif df[col].notna().sum() < 2:
-            skipped[col] = "fewer than 2 non-null values"
-        elif df[col].nunique(dropna=True) < 2:
-            skipped[col] = "constant column"
-        else:
-            usable.append(col)
+    if strength < weak_threshold:
+        result["mutual_information"] = mutual_information(x, y, x_role, y_role)
+        result["escalated_to_mi"] = True
 
-    pairs = {}
-    multicollinearity_flags = []
-
-    for col_a, col_b in itertools.combinations(usable, 2):
-        try:
-            a, b = df[col_a], df[col_b]
-            mask = a.notna() & b.notna()
-            a, b = a[mask], b[mask]
-
-            if len(a) < 2 or a.nunique() < 2 or b.nunique() < 2:
-                skipped[f"{col_a}|{col_b}"] = "insufficient overlapping variation"
-                continue
-
-            a_cat, b_cat = is_categorical(a), is_categorical(b)
-
-            if not a_cat and not b_cat:
-                value, p = stats.spearmanr(a, b)
-                used_method = "spearman"
-                if abs(value) > MULTICOLLINEARITY_THRESHOLD:
-                    multicollinearity_flags.append([col_a, col_b, _safe_float(value)])
-            elif a_cat and b_cat:
-                contingency = pd.crosstab(a, b)
-                chi2, p, _, _ = stats.chi2_contingency(contingency)
-                n = contingency.values.sum()
-                r, k = contingency.shape
-                value = float(np.sqrt(chi2 / (n * (min(r, k) - 1))))
-                used_method = "cramers_v"
-            else:
-                num, cat = (a, b) if not a_cat else (b, a)
-                groups = [num[cat == level] for level in cat.unique()]
-                f_stat, p = stats.f_oneway(*groups)
-                value = float(f_stat)
-                used_method = "anova_f"
-
-            escalated = used_method in ("spearman", "cramers_v") and abs(value) < WEAK_THRESHOLD
-            mutual_info = None
-            if escalated:
-                try:
-                    if a_cat and not b_cat:
-                        x = LabelEncoder().fit_transform(a.astype(str)).reshape(-1, 1)
-                        mutual_info = float(mutual_info_regression(x, b, discrete_features=True, random_state=0)[0])
-                    elif b_cat and not a_cat:
-                        x = LabelEncoder().fit_transform(b.astype(str)).reshape(-1, 1)
-                        mutual_info = float(mutual_info_regression(x, a, discrete_features=True, random_state=0)[0])
-                    elif a_cat and b_cat:
-                        x = LabelEncoder().fit_transform(a.astype(str)).reshape(-1, 1)
-                        y = LabelEncoder().fit_transform(b.astype(str))
-                        mutual_info = float(mutual_info_classif(x, y, discrete_features=True, random_state=0)[0])
-                    else:
-                        x = a.to_numpy().reshape(-1, 1)
-                        mutual_info = float(mutual_info_regression(x, b, random_state=0)[0])
-                except Exception:
-                    mutual_info = None  # leave unset rather than fail the whole matrix
-
-            pairs[f"{col_a}|{col_b}"] = {
-                "method": used_method,
-                "value": _safe_float(value),
-                "p_value": _safe_float(p),
-                "escalated": escalated,
-                "mutual_info": _safe_float(mutual_info) if mutual_info is not None else None,
-            }
-        except Exception as e:
-            # One degenerate pair (e.g. a chi-square/ANOVA edge case)
-            # should not take down the whole matrix -- record and move on.
-            skipped[f"{col_a}|{col_b}"] = f"computation error: {e}"
-
-    return {
-        "pairs": pairs,
-        "multicollinearity_flags": multicollinearity_flags,
-        "skipped": skipped,
-    }
+    return result
