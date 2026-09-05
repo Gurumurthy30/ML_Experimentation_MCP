@@ -13,56 +13,75 @@ Workflow:
 All returned dicts are built from native Python types (str/int/float/
 list/dict) rather than numpy/pandas scalars, since the values need to
 survive JSON serialization when returned over MCP.
+
+NOTE ON THIS VERSION: docstrings below describe the CURRENT, AS-WRITTEN
+behavior of each function, including known bugs and unimplemented
+pieces, because these docstrings double as the prompt an LLM agent
+reads before deciding how to call these tools. Where behavior doesn't
+match what the function name implies, that's called out explicitly
+rather than glossed over. See the "Known bug" / "Current behavior"
+notes -- these are things to fix, not things to rely on.
 """
 
+import itertools
+import math
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
 import pandas as pd
+from scipy import stats
+from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+from sklearn.preprocessing import LabelEncoder
+
 from cache import (
-    compute_dataset_id,
-    dataset_parquet_path,
-    save_dataset,
-    load_dataset_df,
+    get_cache_dir,
+    compute_handle_id,
+    save_object,
+    load_object,
+    object_exists,
 )
 
 
-def load_dataset(path: str) -> dict:
-    """Ingest a CSV/Parquet file, caching it for all later tool calls.
+def _safe_float(value) -> Optional[float]:
+    """Casts to float and converts NaN/Infinity to None. Plain JSON has
+    no representation for NaN/Infinity, so leaving them in as float
+    silently breaks structured-output serialization for the whole
+    response -- better to surface them as an explicit null."""
+    value = float(value)
+    return value if math.isfinite(value) else None
 
-    Computes a deterministic `dataset_id` from the file's absolute
-    path, modification time, and size (see
-    `cache.compute_dataset_id`). If a cached Parquet copy for that ID
-    doesn't already exist, the file is read with pandas and written
-    to the cache. Every other function in this module takes the
-    returned `dataset_id`, not the original file path.
 
-    Args:
-        path: Path to a `.csv` or `.parquet` file on disk.
-
-    Returns:
-        {
-            "dataset_id": str,   # pass this to every other tool
-            "n_rows": int,
-            "n_cols": int,
-            "dtypes": {column_name: dtype_as_string, ...},
-        }
-
-    Raises:
-        FileNotFoundError: if `path` does not exist.
-        ValueError: if `path` doesn't end in `.csv` or `.parquet`.
+def load_dataset(path: str, delimiter: Optional[str] = None, encoding: Optional[str] = None) -> dict:
+    """dataset_id = compute_handle_id(abspath, mtime, size). On a cache
+    miss, reads CSV (via delimiter/encoding, only used to override
+    auto-detection) or Parquet based on file extension, and writes it to
+    _cache/datasets/{id}.parquet. On a cache hit, skips straight to
+    reading the cached Parquet. Calling this again on the same
+    unmodified file is a cache hit; editing the file changes its mtime
+    and size, so it gets a new id and is treated as a fresh dataset.
+    Returns {dataset_id, n_rows, n_cols, dtypes}.
     """
-    dataset_id = compute_dataset_id(path)
-    cache_path = dataset_parquet_path(dataset_id)
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"No such file: {resolved}")
 
-    if cache_path.exists():
-        df = load_dataset_df(dataset_id)
-    else:
-        if path.endswith(".csv"):
-            df = pd.read_csv(path)
-        elif path.endswith(".parquet"):
-            df = pd.read_parquet(path)
+    stat = resolved.stat()
+    dataset_id = compute_handle_id(str(resolved), stat.st_mtime, stat.st_size)
+
+    if not object_exists("datasets", dataset_id):
+        if resolved.suffix.lower() == ".parquet":
+            df = pd.read_parquet(resolved)
         else:
-            raise ValueError(f"Unsupported file format: {path}")
-        save_dataset(df, dataset_id)
+            read_kwargs = {}
+            if delimiter is not None:
+                read_kwargs["sep"] = delimiter
+            if encoding is not None:
+                read_kwargs["encoding"] = encoding
+            df = pd.read_csv(resolved, **read_kwargs)
+        save_object(df, "datasets", dataset_id)
 
+    df = load_object("datasets", dataset_id)
     return dict(
         dataset_id=dataset_id,
         n_rows=int(df.shape[0]),
@@ -71,24 +90,22 @@ def load_dataset(path: str) -> dict:
     )
 
 
-def infer_column_eoles(dataset_id: str) -> dict:
-    """Summarize each column's dtype, cardinality, and sample values.
+def infer_column_roles(dataset_id: str, mode: str = "permissive") -> dict:
+    """Loads the cached DataFrame and returns basic per-column
+    introspection: dtype, number of unique values, and up to 5 sample
+    non-null values.
 
-    Args:
-        dataset_id: ID returned by `load_dataset`.
+    Current behavior (as implemented):
+    - Does NOT classify columns into semantic roles (numeric_continuous,
+      numeric_discrete, categorical_nominal, categorical_ordinal,
+      datetime, boolean, text_freeform, identifier, constant) despite
+      the function name -- no `role` or `confidence` field is produced.
+    - The `mode` parameter ('permissive'/'strict') is accepted but has
+      no effect; there's no low-confidence-guess logic for it to toggle.
 
-    Returns:
-        dict mapping column name -> {
-            "dtype": str,
-            "n_unique": int,          # distinct non-null values
-            "sample_values": list,    # up to 5 non-null values
-        }
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet
-            (call `load_dataset` first).
+    Returns {column_name: {dtype, n_unique, sample_values}}.
     """
-    df = load_dataset_df(dataset_id)
+    df = load_object("datasets", dataset_id)
     inferred = {}
     for col in df.columns:
         inferred[col] = {
@@ -99,78 +116,105 @@ def infer_column_eoles(dataset_id: str) -> dict:
     return inferred
 
 
-def profile_dataset(dataset_id: str) -> dict:
-    """Build a compact statistical profile of every column.
+def profile_dataset(dataset_id: str, depth: str = "full") -> dict:
+    """Per-column stats appropriate to its dtype. Every column always
+    gets {dtype, missing_pct} at minimum, for both depths -- depth only
+    controls how much *extra* detail is added on top, it never drops a
+    column from the output.
 
-    Numeric columns get min/max/mean/std/skew (skew via pandas'
-    `Series.skew`, a bias-corrected estimate equivalent to
-    `scipy.stats.skew(..., bias=False)`). Non-numeric columns get
-    their 10 most frequent values with counts. Every column reports
-    its missing-value percentage.
+    - Numeric: min/max/mean/std/skew always included. depth='full' adds
+      kurtosis and a normality test (scipy.stats.normaltest, requires
+      >=8 non-null values; noted separately if there aren't enough).
+      depth='quick' skips both to keep the payload small.
+    - Datetime: min/max and pandas-inferred frequency, both depths.
+    - Categorical (object, category, or bool dtype -- this now also
+      covers plain string columns from a CSV, not just pandas' explicit
+      'category' dtype): cardinality always included; depth='full' adds
+      top-10 values with counts.
+    - Any float that would serialize as NaN/Infinity (e.g. std of a
+      column with one non-null value) is reported as null instead,
+      since raw NaN/Infinity breaks JSON output.
 
-    Kept intentionally compact -- this is the payload a planning step
-    reasons over, not a full data dump.
-
-    Args:
-        dataset_id: ID returned by `load_dataset`.
-
-    Returns:
-        dict mapping column name -> a profile dict. Numeric columns:
-        {dtype, missing_pct, min, max, mean, std, skew}. Non-numeric
-        columns: {dtype, missing_pct, top_values} where top_values
-        maps value -> count for up to 10 values.
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet.
+    Returns {column_name: {dtype, missing_pct, ...dtype-specific
+    fields}}.
     """
-    df = load_dataset_df(dataset_id)
+    df = load_object("datasets", dataset_id)
     profile = {}
+
     for col in df.columns:
         col_data = df[col]
         col_profile = {
             "dtype": str(col_data.dtype),
-            "missing_pct": float(col_data.isnull().mean() * 100),
+            "missing_pct": _safe_float(col_data.isnull().mean() * 100),
         }
+        non_null = col_data.dropna()
+
         if pd.api.types.is_numeric_dtype(col_data):
             col_profile.update({
-                "min": float(col_data.min()),
-                "max": float(col_data.max()),
-                "mean": float(col_data.mean()),
-                "std": float(col_data.std()),
-                "skew": float(col_data.skew()),
+                "min": _safe_float(col_data.min()),
+                "max": _safe_float(col_data.max()),
+                "mean": _safe_float(col_data.mean()),
+                "std": _safe_float(col_data.std()),
+                "skew": _safe_float(col_data.skew()),
             })
-        else:
-            top_values = col_data.value_counts().head(10)
-            col_profile["top_values"] = {
-                str(k): int(v) for k, v in top_values.items()
-            }
+            if depth == "full":
+                col_profile["kurtosis"] = _safe_float(col_data.kurt())
+                if len(non_null) >= 8:
+                    stat, p = stats.normaltest(non_null)
+                    col_profile["normality_stat"] = _safe_float(stat)
+                    col_profile["normality_p_value"] = _safe_float(p)
+                else:
+                    col_profile["normality_test_skipped_reason"] = (
+                        f"needs >=8 non-null values, has {len(non_null)}"
+                    )
+
+        elif pd.api.types.is_datetime64_any_dtype(col_data):
+            col_profile.update({
+                "min": str(col_data.min()),
+                "max": str(col_data.max()),
+                "inferred_freq": pd.infer_freq(non_null),
+            })
+
+        elif (
+            col_data.dtype == object
+            or isinstance(col_data.dtype, pd.CategoricalDtype)
+            or pd.api.types.is_bool_dtype(col_data)
+        ):
+            col_profile["cardinality"] = int(col_data.nunique())
+            if depth == "full":
+                top_values = col_data.value_counts().head(10)
+                col_profile["top_values"] = {
+                    str(k): int(v) for k, v in top_values.items()
+                }
+
         profile[col] = col_profile
     return profile
 
 
-def analyze_target_and_infer_task_type(dataset_id: str, target_column: str) -> dict:
-    """Infer classification vs. regression for a target column.
+def analyze_target_and_infer_task(dataset_id: str, goal_text: str, target_column: Optional[str] = None) -> dict:
+    """Classifies task_type (classification vs regression) from the
+    target column's dtype and cardinality.
 
-    Treated as classification if the column is non-numeric (e.g. a
-    string/category label), or if it's numeric with at most 20
-    distinct values and isn't a float dtype. Otherwise treated as
-    regression.
+    Current behavior (as implemented):
+    - `target_column` is required in practice: the function does
+      `df[target_column]` unconditionally, so passing None raises an
+      error immediately. There is no logic to infer a target column
+      from `goal_text` or from column roles -- `goal_text` is accepted
+      but unused.
+    - Classification rule: the target is treated as classification if
+      it's non-numeric, OR if it has <=20 unique values AND is not a
+      float dtype. NOTE: a low-cardinality float target (e.g. a binary
+      0.0/1.0 label stored as float) will be routed to regression under
+      this rule.
+    - Does NOT return `confidence`, `reasoning`, or
+      `needs_clarification`. Callers cannot currently tell a confident
+      inference from a shaky one, and there's no path for flagging
+      genuine ambiguity back to the caller instead of guessing.
 
-    Args:
-        dataset_id: ID returned by `load_dataset`.
-        target_column: Name of the column to analyze.
-
-    Returns:
-        Classification: {"task_type": "classification",
-            "class_balance": {label: proportion, ...}}
-        Regression: {"task_type": "regression",
-            "distribution_stats": {min, max, mean, std, skew}}
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet.
-        KeyError: if `target_column` isn't in the dataset.
+    Returns, for classification: {task_type, class_balance}.
+    Returns, for regression: {task_type, distribution_stats}.
     """
-    df = load_dataset_df(dataset_id)
+    df = load_object("datasets", dataset_id)
     target_data = df[target_column]
 
     is_classification = not pd.api.types.is_numeric_dtype(target_data) or (
@@ -197,31 +241,24 @@ def analyze_target_and_infer_task_type(dataset_id: str, target_column: str) -> d
 
 
 def analyze_missing_values(dataset_id: str) -> dict:
-    """Report missing-value rates and flag likely non-random missingness.
+    """Per-column missing percentage, plus pairwise correlation between
+    each column's missingness mask and every other column's not-null
+    mask.
 
-    For every column with at least one missing value, computes the
-    correlation between "value is missing in this column" and "value
-    is present in each other column". A strong correlation hints the
-    missingness isn't purely random (MCAR) -- e.g. a 'TotalCharges'
-    column that's null exactly when 'tenure' == 0 will show up as a
-    high correlation between the two.
+    Current behavior (as implemented):
+    - Does NOT compute or return a `likely_mar` flag. It returns the raw
+      correlation values against every other column, unthresholded --
+      nothing is actually flagged as "likely missing-at-random" or
+      otherwise. Anything downstream that branches on a `likely_mar` key
+      (e.g. an 'auto' strategy in a missing-value-handling tool) will
+      not find it here yet.
 
-    Args:
-        dataset_id: ID returned by `load_dataset`.
-
-    Returns:
-        dict mapping column name -> {
-            "missing_pct": float,
-            # present only when missing_pct > 0:
-            "missingness_correlations": {other_col: float | None, ...}
-        }
-        A `None` correlation means it was undefined (e.g. a constant
-        column), not that there's no relationship.
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet.
+    Returns {column_name: {missing_pct, missingness_correlations?}},
+    where missingness_correlations is only present for columns with
+    missing_pct > 0, and maps every other column name to a correlation
+    value (or None if undefined, e.g. a constant column).
     """
-    df = load_dataset_df(dataset_id)
+    df = load_object("datasets", dataset_id)
     missing_info = {}
     for col in df.columns:
         missing_pct = float(df[col].isnull().mean() * 100)
@@ -238,26 +275,20 @@ def analyze_missing_values(dataset_id: str) -> dict:
 
 
 def detect_outliers(dataset_id: str, method: str = "iqr") -> dict:
-    """Flag numeric outliers in every numeric column.
+    """IQR method (Q1 - 1.5*IQR, Q3 + 1.5*IQR) by default, 'zscore'
+    (mean +/- 3*std) as the alternative. Only numeric columns are
+    considered.
 
-    "iqr" (default): values outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
-    "zscore": values more than 3 standard deviations from the mean.
+    Current behavior (as implemented):
+    - The per-column result key is `example_indices` (NOT
+      `example_row_indices`) -- callers reading the result must use
+      `example_indices`.
+    - Raises ValueError for any `method` other than 'iqr' or 'zscore'.
 
-    Args:
-        dataset_id: ID returned by `load_dataset`.
-        method: "iqr" or "zscore".
-
-    Returns:
-        dict mapping numeric column name -> {
-            "outlier_count": int,
-            "example_indices": list,  # up to 5 row indices
-        }
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet.
-        ValueError: if `method` isn't "iqr" or "zscore".
+    Returns {column_name: {outlier_count, example_indices}}, where
+    example_indices is capped at the first 5 matching row indices.
     """
-    df = load_dataset_df(dataset_id)
+    df = load_object("datasets", dataset_id)
     outlier_info = {}
     for col in df.select_dtypes(include=["number"]).columns:
         col_data = df[col].dropna()
@@ -283,19 +314,178 @@ def detect_outliers(dataset_id: str, method: str = "iqr") -> dict:
     return outlier_info
 
 
-def detect_target_leakage(dataset_id: str, target_column: str) -> dict:
-    """Flag columns that have a strong correlation with the target.
+def detect_target_leakage(dataset_id: str, target_column: str, outcome_time_column: Optional[str] = None, correlation_threshold: float = 0.98) -> dict:
+    """Intended to be a heuristic, advisory-only leakage check (never
+    auto-dropping columns): identifier-like columns, columns over a
+    correlation threshold with the target, and -- if given -- features
+    timestamped after outcome_time_column.
 
-    Args:
-        dataset_id: ID returned by `load_dataset`.
-        target_column: Name of the target column.
+    Current behavior (as implemented) -- substantially not yet built:
+    - Returns a flat {column: correlation_with_target} dict, not the
+      documented {column, reason, evidence} structure.
+    - No identifier-ratio check (n_unique/n_rows > 0.95) is performed.
+    - `correlation_threshold` is accepted but never used -- nothing is
+      actually filtered or flagged against it.
+    - `outcome_time_column` is accepted but never used.
+    - Non-numeric feature columns will produce NaN from
+      `target.corr(...)` rather than being handled, encoded, or
+      excluded with a reason.
+    - KNOWN BUG (mutates shared state): `df.pop(target_column)` mutates
+      whatever DataFrame object `load_object` returns. If that's a
+      cached reference rather than a fresh copy, this permanently
+      removes the target column from the cached dataset for this
+      `dataset_id` -- affecting every subsequent call to this or any
+      other function against the same `dataset_id`, not just this call.
 
-    Returns:
-        dict mapping column name -> correlation.
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet.
+    Returns {column_name: correlation_with_target_or_None}.
     """
-    df = load_dataset_df(dataset_id)
+    df = load_object("datasets", dataset_id)
     target = df.pop(target_column)
     return {col: target.corr(df[col]) for col in df.columns}
+
+
+def measure_associations(dataset_id: str, method: str = "auto", columns: Optional[list[str]] = None) -> dict:
+    """Pairwise association matrix over `columns` (default: all columns
+    in the dataset). method='auto' is currently the only supported
+    value; anything else raises ValueError.
+
+    Per unordered pair, 'auto' picks:
+      - Spearman rank correlation, for numeric-numeric pairs
+      - Cramer's V (via a chi-square test of independence), for
+        categorical-categorical pairs
+      - ANOVA F-statistic (numeric grouped by categorical levels), for
+        mixed numeric-categorical pairs
+    A column counts as categorical if its dtype is object, category, or
+    bool; datetime columns are not supported and are skipped.
+
+    Whenever the primary method is on a 0-1 correlation scale (spearman
+    or cramers_v -- not anova_f, which isn't bounded that way) and its
+    magnitude is below 0.1, the pair is escalated to mutual information
+    (sklearn's mutual_info_regression/mutual_info_classif) as a
+    non-linear-aware fallback. Escalation never overrides the primary
+    value; both are reported.
+
+    columns restricts which pairs get computed, for speed on wide
+    datasets. Pairs involving a constant column, a column with fewer
+    than 2 non-null values, or fewer than 2 overlapping non-null rows
+    after aligning the pair, are skipped (with a reason) rather than
+    guessed at.
+
+    Returns:
+        {
+          "pairs": {
+            "colA|colB": {
+              "method": "spearman" | "cramers_v" | "anova_f",
+              "value": float,
+              "p_value": float,
+              "escalated": bool,
+              "mutual_info": float | None,  # set only if escalated
+            }, ...
+          },
+          "multicollinearity_flags": [[colA, colB, spearman_value], ...],
+              # numeric-numeric pairs with |spearman| > 0.85
+          "skipped": {"colX" or "colA|colB": "reason", ...},
+        }
+    """
+    if method != "auto":
+        raise ValueError(f"Unsupported method: {method!r}. Only 'auto' is implemented.")
+
+    df = load_object("datasets", dataset_id)
+    columns = list(columns) if columns is not None else list(df.columns)
+    for col in columns:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found in dataset.")
+
+    WEAK_THRESHOLD = 0.1
+    MULTICOLLINEARITY_THRESHOLD = 0.85
+
+    def is_categorical(s):
+        return (
+            s.dtype == object
+            or isinstance(s.dtype, pd.CategoricalDtype)
+            or pd.api.types.is_bool_dtype(s)
+        )
+
+    skipped = {}
+    usable = []
+    for col in columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            skipped[col] = "datetime columns not supported"
+        elif df[col].notna().sum() < 2:
+            skipped[col] = "fewer than 2 non-null values"
+        elif df[col].nunique(dropna=True) < 2:
+            skipped[col] = "constant column"
+        else:
+            usable.append(col)
+
+    pairs = {}
+    multicollinearity_flags = []
+
+    for col_a, col_b in itertools.combinations(usable, 2):
+        try:
+            a, b = df[col_a], df[col_b]
+            mask = a.notna() & b.notna()
+            a, b = a[mask], b[mask]
+
+            if len(a) < 2 or a.nunique() < 2 or b.nunique() < 2:
+                skipped[f"{col_a}|{col_b}"] = "insufficient overlapping variation"
+                continue
+
+            a_cat, b_cat = is_categorical(a), is_categorical(b)
+
+            if not a_cat and not b_cat:
+                value, p = stats.spearmanr(a, b)
+                used_method = "spearman"
+                if abs(value) > MULTICOLLINEARITY_THRESHOLD:
+                    multicollinearity_flags.append([col_a, col_b, _safe_float(value)])
+            elif a_cat and b_cat:
+                contingency = pd.crosstab(a, b)
+                chi2, p, _, _ = stats.chi2_contingency(contingency)
+                n = contingency.values.sum()
+                r, k = contingency.shape
+                value = float(np.sqrt(chi2 / (n * (min(r, k) - 1))))
+                used_method = "cramers_v"
+            else:
+                num, cat = (a, b) if not a_cat else (b, a)
+                groups = [num[cat == level] for level in cat.unique()]
+                f_stat, p = stats.f_oneway(*groups)
+                value = float(f_stat)
+                used_method = "anova_f"
+
+            escalated = used_method in ("spearman", "cramers_v") and abs(value) < WEAK_THRESHOLD
+            mutual_info = None
+            if escalated:
+                try:
+                    if a_cat and not b_cat:
+                        x = LabelEncoder().fit_transform(a.astype(str)).reshape(-1, 1)
+                        mutual_info = float(mutual_info_regression(x, b, discrete_features=True, random_state=0)[0])
+                    elif b_cat and not a_cat:
+                        x = LabelEncoder().fit_transform(b.astype(str)).reshape(-1, 1)
+                        mutual_info = float(mutual_info_regression(x, a, discrete_features=True, random_state=0)[0])
+                    elif a_cat and b_cat:
+                        x = LabelEncoder().fit_transform(a.astype(str)).reshape(-1, 1)
+                        y = LabelEncoder().fit_transform(b.astype(str))
+                        mutual_info = float(mutual_info_classif(x, y, discrete_features=True, random_state=0)[0])
+                    else:
+                        x = a.to_numpy().reshape(-1, 1)
+                        mutual_info = float(mutual_info_regression(x, b, random_state=0)[0])
+                except Exception:
+                    mutual_info = None  # leave unset rather than fail the whole matrix
+
+            pairs[f"{col_a}|{col_b}"] = {
+                "method": used_method,
+                "value": _safe_float(value),
+                "p_value": _safe_float(p),
+                "escalated": escalated,
+                "mutual_info": _safe_float(mutual_info) if mutual_info is not None else None,
+            }
+        except Exception as e:
+            # One degenerate pair (e.g. a chi-square/ANOVA edge case)
+            # should not take down the whole matrix -- record and move on.
+            skipped[f"{col_a}|{col_b}"] = f"computation error: {e}"
+
+    return {
+        "pairs": pairs,
+        "multicollinearity_flags": multicollinearity_flags,
+        "skipped": skipped,
+    }

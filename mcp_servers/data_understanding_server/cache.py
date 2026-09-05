@@ -1,57 +1,64 @@
 from pathlib import Path
 import hashlib
-import pandas as pd
+import json
 import os
+import pandas as pd
 
 
 def get_cache_dir() -> Path:
-    """
-    Return the root cache directory.
-    """
-    cache_dir = Path("../Data/_Cache")
+    """Reads the TABULARML_CACHE_DIR env var. Default is an absolute
+    path (<project_root>/data/_cache), NOT a relative one, so all
+    server processes resolve to the same directory regardless of each
+    process's working directory at launch time."""
+    default_dir =  "../data/_cache"
+    cache_dir = Path(os.environ.get("TABULARML_CACHE_DIR", default_dir))
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
-def get_dataset_cache_dir() -> Path:
-    """
-    Return the dataset cache directory.
-    """
-    dataset_cache_dir = get_cache_dir() / "datasets"
-    os.makedirs(dataset_cache_dir, exist_ok=True)
-    return dataset_cache_dir
 
-def compute_dataset_id(path: str) -> str:
-    """
-    Generate a deterministic ID for a dataset.
-
-    The ID changes if:
-    - absolute path changes
-    - modification time changes
-    - file size changes
-    """
-    file_path = Path(path).resolve()
-    if not file_path.exists():
-        raise FileNotFoundError(f"Dataset not found: {file_path}")
-    stat = file_path.stat()
-    identity = (f"{file_path}"f"|{stat.st_mtime_ns}"f"|{stat.st_size}")
-    return hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
+def compute_handle_id(*parts) -> str:
+    """sha1 of the JSON-serialized parts (order preserved, not sorted),
+    truncated to 12 chars. Same inputs, same order, always produce the
+    same ID."""
+    m = hashlib.sha1()
+    m.update(json.dumps(parts, default=str).encode("utf-8"))
+    return m.hexdigest()[:12]
 
 
-def dataset_parquet_path(dataset_id: str) -> Path:
-    """Return the cache path for a dataset ID."""
-    return get_dataset_cache_dir() / f"{dataset_id}.parquet"
+def save_object(obj, subdir: str, handle_id: str) -> None:
+    """Writes obj under {cache_dir}/{subdir}/{handle_id}.*, choosing
+    .parquet for DataFrames and .joblib for everything else (unfitted
+    pipeline specs, fitted models, any other sklearn object)."""
+    path = get_cache_dir() / subdir
+    os.makedirs(path, exist_ok=True)
+    if isinstance(obj, pd.DataFrame):
+        obj.to_parquet(path / f"{handle_id}.parquet", index=False)
+    else:
+        import joblib
+        joblib.dump(obj, path / f"{handle_id}.joblib")
 
 
-def save_dataset(df: pd.DataFrame, dataset_id: str) -> Path:
-    """Save DataFrame into the dataset cache."""
-    path = dataset_parquet_path(dataset_id)
-    df.to_parquet(path,index=False)
-    return path
+def load_object(subdir: str, handle_id: str):
+    """Reverse of save_object -- reconstitutes the real DataFrame, spec,
+    or model from disk given just the handle_id string. This is the call
+    every tool makes as its first line when it receives a handle as an
+    argument."""
+    path = get_cache_dir() / subdir
+    parquet_path = path / f"{handle_id}.parquet"
+    joblib_path = path / f"{handle_id}.joblib"
+    if parquet_path.exists():
+        return pd.read_parquet(parquet_path)
+    elif joblib_path.exists():
+        import joblib
+        return joblib.load(joblib_path)
+    else:
+        raise FileNotFoundError(f"Cached object not found: {subdir}/{handle_id}")
 
 
-def load_dataset_df(dataset_id: str) -> pd.DataFrame:
-    """Load a cached dataset using its ID."""
-    path = dataset_parquet_path(dataset_id)
-    if not path.exists():
-        raise FileNotFoundError(f"Cached dataset not found: {dataset_id}")
-    return pd.read_parquet(path)
+def object_exists(subdir: str, handle_id: str) -> bool:
+    """Cheap existence check, used before recomputing anything expensive
+    -- e.g. finalize_model checks this before actually fitting."""
+    path = get_cache_dir() / subdir
+    parquet_path = path / f"{handle_id}.parquet"
+    joblib_path = path / f"{handle_id}.joblib"
+    return parquet_path.exists() or joblib_path.exists()

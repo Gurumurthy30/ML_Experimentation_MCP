@@ -1,8 +1,8 @@
 # testing folder
 testing/*
 
-# cache files
-data/cache/*
+# data folder
+**/data/
 
 # mlflow
 mlruns/*
@@ -14,5 +14,4 @@ mlflow.db
 .venv/
 
 # __pycache__
-__pycache__/
-mcp_servers/data_understanding_server/__pycache__/
+**/__pycache__/
