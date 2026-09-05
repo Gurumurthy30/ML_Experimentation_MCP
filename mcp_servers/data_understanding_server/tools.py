@@ -283,60 +283,19 @@ def detect_outliers(dataset_id: str, method: str = "iqr") -> dict:
     return outlier_info
 
 
-def detect_correlations(dataset_id: str, threshold: float = 0.8) -> dict:
-    """Find pairs of numeric columns correlated above a threshold.
+def detect_target_leakage(dataset_id: str, target_column: str) -> dict:
+    """Flag columns that have a strong correlation with the target.
 
     Args:
         dataset_id: ID returned by `load_dataset`.
-        threshold: Minimum absolute Pearson correlation to report.
+        target_column: Name of the target column.
 
     Returns:
-        dict mapping column name -> list of (other_column, correlation)
-        pairs whose absolute correlation exceeds `threshold`. Each
-        pair appears twice, once under each column's key.
+        dict mapping column name -> correlation.
 
     Raises:
         FileNotFoundError: if `dataset_id` hasn't been cached yet.
     """
     df = load_dataset_df(dataset_id)
-    numeric_df = df.select_dtypes(include=["number"])
-    corr_matrix = numeric_df.corr()
-    correlated_pairs = {}
-    for col in corr_matrix.columns:
-        for idx in corr_matrix.index:
-            if col != idx and abs(corr_matrix.loc[idx, col]) > threshold:
-                correlated_pairs.setdefault(col, []).append(
-                    (idx, float(corr_matrix.loc[idx, col]))
-                )
-    return correlated_pairs
-
-
-def detect_multicollinearity(dataset_id: str, threshold: float = 0.8) -> dict:
-    """Find numeric columns involved in any high-correlation pair.
-
-    A flat-list companion to `detect_correlations` -- useful as a
-    quick "which columns are candidates to drop" check, without the
-    pair-level detail.
-
-    Args:
-        dataset_id: ID returned by `load_dataset`.
-        threshold: Minimum absolute Pearson correlation for two
-            columns to count as multicollinear.
-
-    Returns:
-        {"multicollinear_columns": [column names appearing in at
-         least one pair with |correlation| > threshold]}
-
-    Raises:
-        FileNotFoundError: if `dataset_id` hasn't been cached yet.
-    """
-    df = load_dataset_df(dataset_id)
-    numeric_df = df.select_dtypes(include=["number"])
-    corr_matrix = numeric_df.corr()
-    multicollinear_cols = set()
-    for col in corr_matrix.columns:
-        for idx in corr_matrix.index:
-            if col != idx and abs(corr_matrix.loc[idx, col]) > threshold:
-                multicollinear_cols.add(col)
-                multicollinear_cols.add(idx)
-    return {"multicollinear_columns": list(multicollinear_cols)}
+    target = df.pop(target_column)
+    return {col: target.corr(df[col]) for col in df.columns}

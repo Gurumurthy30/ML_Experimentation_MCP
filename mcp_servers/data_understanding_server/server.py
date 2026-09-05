@@ -16,8 +16,7 @@ from tools import (
     analyze_target_and_infer_task_type,
     analyze_missing_values,
     detect_outliers,
-    detect_correlations,
-    detect_multicollinearity,
+    detect_target_leakage,
 )
 
 mcp = FastMCP("dataset-server")
@@ -28,8 +27,7 @@ mcp.tool()(profile_dataset)
 mcp.tool()(analyze_target_and_infer_task_type)
 mcp.tool()(analyze_missing_values)
 mcp.tool()(detect_outliers)
-mcp.tool()(detect_correlations)
-mcp.tool()(detect_multicollinearity)
+mcp.tool()(detect_target_leakage)
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
