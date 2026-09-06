@@ -7,6 +7,16 @@ or as a module from the project root (requires __init__.py in both
 `mcp_servers/` and `mcp_servers/data_understanding_server/`):
     python -m mcp_servers.data_understanding_server.server
 """
+import sys
+from pathlib import Path
+
+THIS_DIR = Path(__file__).resolve().parent      # .../mcp_servers/data_understanding_server
+PARENT_DIR = THIS_DIR.parent                    # .../mcp_servers
+
+for _p in (THIS_DIR, PARENT_DIR):
+    _p_str = str(_p)
+    if _p_str not in sys.path:
+        sys.path.insert(0, _p_str)
 
 from fastmcp import FastMCP
 from tools import (

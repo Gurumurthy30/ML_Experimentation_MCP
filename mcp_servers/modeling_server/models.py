@@ -1,14 +1,18 @@
 MODEL_REGISTRY = {
-    "logistic_regression": (LogisticRegression, dict(max_iter=1000, class_weight="balanced")),
-    "random_forest":       (RandomForestClassifier, dict(n_estimators=300, class_weight="balanced", n_jobs=-1)),
-    "gradient_boosting":   (HistGradientBoostingClassifier, dict(max_iter=200)),
+    "linear": {"regression": Ridge, "classification": LogisticRegression},
+    "tree_ensemble": {"regression": HistGradientBoostingRegressor,
+                       "classification": HistGradientBoostingClassifier},
 }
+"""Deliberately small and fixed -- model choice is not a search dimension
+in this project. hyperparams passed to cross_validate_model overrides
+these defaults, never replaces the family."""
 
-def get_model(model_type: str, hyperparams: dict | None = None):
-    """Merges hyperparams over MODEL_REGISTRY defaults, instantiates."""
+def get_model(model_family: str, task_type: str, hyperparams: dict = None):
+    """Looks up MODEL_REGISTRY[model_family][task_type], instantiates it
+    with hyperparams merged over its defaults."""
 
-def compute_model_id(split_id: str, pipeline_id: str, model_type: str, hyperparams: dict | None) -> str:
-    """sha1 of the sorted, JSON-serialized tuple. Deterministic -- this IS
-    the idempotency mechanism train_model relies on."""
-
-def model_exists(model_id: str) -> bool
+def compute_model_id(folds_id: str, pipeline_spec_id: str, model_family: str, hyperparams: dict) -> str:
+    """sha1 of the sorted, JSON-serialized tuple of all four inputs.
+    Deterministic -- finalize_model checks this before fitting, so calling
+    it twice with identical inputs returns the existing model_id instead
+    of refitting."""

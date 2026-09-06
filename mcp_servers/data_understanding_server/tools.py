@@ -23,18 +23,13 @@ rather than glossed over. See the "Known bug" / "Current behavior"
 notes -- these are things to fix, not things to rely on.
 """
 
-import itertools
 import math
+import numpy as np
+import pandas as pd
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-import pandas as pd
-from scipy import stats
-from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-from sklearn.preprocessing import LabelEncoder
-
-from cache import (
+from shared.cache import (
     compute_handle_id,
     save_object,
     load_object,
@@ -167,12 +162,12 @@ def profile_dataset(dataset_id: str, depth: str = "full") -> dict:
                 "skew": _safe_float(col_data.skew()),
             })
             if depth == "full":
-                col_profile["kurtosis"] = compute_kurtosis(col_data)
+                col_profile["kurtosis"] = _safe_float(compute_kurtosis(col_data))
                 if len(non_null) >= 8:
-                    is_norm, stat, p = test_normality(col_data)
-                    col_profile["is_normal"] = is_norm
-                    col_profile["normality_stat"] = _safe_float(stat)
-                    col_profile["normality_p_value"] = _safe_float(p)
+                    normality = test_normality(col_data)
+                    col_profile["is_normal"] = bool(normality["is_normal"])
+                    col_profile["normality_stat"] = _safe_float(normality["statistic"])
+                    col_profile["normality_p_value"] = _safe_float(normality["p_value"])
                 else:
                     col_profile["normality_test_skipped_reason"] = (
                         f"needs >=8 non-null values, has {len(non_null)}"
@@ -354,42 +349,60 @@ def detect_target_leakage(dataset_id: str, target_column: str, outcome_time_colu
     return {col: target.corr(df[col]) for col in df.columns}
 
 
-def measure_associations(x: pd.Series, y: pd.Series, x_role: str, y_role: str,
-                          method: str = "auto", weak_threshold: float = 0.1) -> dict:
-    """Computes an association statistic between two columns. If method='auto',
-    picks the method via auto_select_association_method based on (x_role, y_role).
-    If the primary statistic's effect size is below weak_threshold, escalates to
-    mutual_information, since Spearman/Cramer's V/ANOVA-F only catch monotonic,
-    categorical-association, or mean-shift relationships respectively. Returns a
-    dict with the method(s) used, their scores, and whether MI escalation fired.
+def measure_associations(dataset_id: str, column_a: str, column_b: str,
+                          role_a: str, role_b: str, method: str = "auto",
+                          weak_threshold: float = 0.1) -> dict:
+    """Computes an association statistic between two columns of a cached
+    dataset. If method='auto', picks the method via
+    auto_select_association_method based on (role_a, role_b). If the
+    primary statistic's effect size is below weak_threshold, escalates to
+    mutual_information, since Spearman/Cramer's V/ANOVA-F only catch
+    monotonic, categorical-association, or mean-shift relationships
+    respectively.
+
+    role_a/role_b are not inferred here -- infer_column_roles does not
+    yet classify semantic roles, so the caller must pass "numeric" or
+    "categorical" for each column explicitly.
+
+    Returns {method, ...method-specific fields, strength, escalated_to_mi,
+    mutual_information?}.
     """
+    df = load_object("datasets", dataset_id)
+    x = df[column_a]
+    y = df[column_b]
+
     if method == "auto":
-        method = auto_select_association_method(x_role, y_role)
+        method = auto_select_association_method(role_a, role_b)
 
     result = {"method": method}
 
     if method == "spearman":
         corr = spearman_correlation(x, y)
-        result["rho"] = corr["rho"]
-        result["p_value"] = corr["p_value"]
-        strength = abs(corr["rho"])
+        rho = corr["rho"]
+        result["rho"] = _safe_float(rho)
+        result["p_value"] = _safe_float(corr["p_value"])
+        strength = abs(rho) if rho is not None and not math.isnan(rho) else 0.0
     elif method == "cramers_v":
         v = cramers_v(x, y)
-        result["cramers_v"] = v
-        strength = v
+        result["cramers_v"] = _safe_float(v)
+        strength = v if v is not None and not math.isnan(v) else 0.0
     elif method == "anova":
-        categorical, numeric = (x, y) if x_role == "categorical" else (y, x)
+        categorical, numeric = (x, y) if role_a == "categorical" else (y, x)
         anova = anova_f_eta_squared(categorical, numeric)
-        result.update(anova)
-        strength = np.sqrt(anova["eta_squared"]) if not np.isnan(anova["eta_squared"]) else 0.0
+        result["f_statistic"] = _safe_float(anova["f_statistic"])
+        result["p_value"] = _safe_float(anova["p_value"])
+        result["eta_squared"] = _safe_float(anova["eta_squared"])
+        eta = anova["eta_squared"]
+        strength = math.sqrt(eta) if eta is not None and not math.isnan(eta) else 0.0
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    result["strength"] = strength
+    result["strength"] = _safe_float(strength)
     result["escalated_to_mi"] = False
 
     if strength < weak_threshold:
-        result["mutual_information"] = mutual_information(x, y, x_role, y_role)
+        mi = mutual_information(x, y, role_a, role_b)
+        result["mutual_information"] = _safe_float(mi)
         result["escalated_to_mi"] = True
 
     return result

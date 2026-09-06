@@ -1,14 +1,19 @@
 from mcp.server.fastmcp import FastMCP
 from . import tools
 
-mcp = FastMCP("training-server")
+mcp = FastMCP("modeling-server")
 
-mcp.tool()(tools.split_dataset)
-mcp.tool()(tools.create_preprocessing_pipeline)
-mcp.tool()(tools.train_model)
-mcp.tool()(tools.evaluate_model)
+mcp.tool()(tools.establish_baseline)
 mcp.tool()(tools.cross_validate_model)
-mcp.tool()(tools.predict)
+mcp.tool()(tools.diagnose_fit)
+mcp.tool()(tools.regularization_path_search)
+mcp.tool()(tools.handle_class_imbalance)
+mcp.tool()(tools.calibrate_probabilities)
+mcp.tool()(tools.tune_decision_threshold)
+mcp.tool()(tools.explain_predictions)
+mcp.tool()(tools.analyze_prediction_errors)
+mcp.tool()(tools.finalize_model)
+mcp.tool()(tools.final_test_evaluation)
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

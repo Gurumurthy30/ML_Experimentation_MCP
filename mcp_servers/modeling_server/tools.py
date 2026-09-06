@@ -1,33 +1,74 @@
-def split_dataset(dataset_id: str, target_column: str, test_size: float = 0.2,
-                   strategy: str = "stratified", random_state: int = 42) -> dict:
-    """Writes _cache/splits/{split_id}/{train,test}.parquet. split_id is a
-    hash of (dataset_id, target_column, test_size, strategy, random_state)
-    -- same inputs always resolve to the same split_id (idempotent)."""
+def establish_baseline(split_id: str, task_type: str) -> dict:
+    """Fits a trivial predictor once against split_id's train partition --
+    mean/median for regression, majority-class/stratified for
+    classification -- and evaluates it. No CV needed since a constant
+    predictor can't overfit. Returns {metric: value}, the floor every
+    later model gets compared against."""
 
-def create_preprocessing_pipeline(dataset_id: str, target_column: str, config: dict) -> dict:
-    """config = {numeric_impute, categorical_impute, encoding_strategy,
-    scale: bool}. Delegates to pipelines.build_column_transformer, saves
-    the unfitted Pipeline via joblib under a config-derived pipeline_id."""
+def cross_validate_model(folds_id: str, pipeline_spec_id: str, model_family: str, hyperparams: dict = None) -> dict:
+    """THE default scoring call for every candidate configuration.
+    Internally: for each (train_idx, val_idx) in folds_id, clones
+    pipeline_spec_id fresh via cv.clone_pipeline_from_spec(), fits on
+    train_idx rows only (this is where imputation/encoding/scaling/
+    feature selection actually get fit, correctly, per fold), scores on
+    val_idx. Produces no persisted model -- scoring only. Returns
+    {metric: {mean, std}} plus per_fold_scores."""
 
-def train_model(split_id: str, pipeline_id: str, model_type: str,
-                 hyperparams: dict | None = None) -> dict:
-    """model_id = hash(split_id, pipeline_id, model_type, hyperparams).
-    If _cache/models/{model_id}.joblib already exists, return it unchanged
-    -- this is the idempotency check that makes crash-recovery safe.
-    Otherwise: load train split, clone pipeline, attach estimator from
-    models.get_model(), fit(X_train, y_train), joblib.dump. Calls
-    failure_injection.maybe_inject_failure(model_type) before fitting."""
+def diagnose_fit(folds_id: str, pipeline_spec_id: str, model_family: str, cv_result: dict) -> dict:
+    """Re-runs the same per-fold fit as cross_validate_model but also
+    captures each fold's train-set score (omitted from cv_result to keep
+    that payload small) and compares it to the val score already
+    computed. Returns {train_val_gap, gap_std_across_folds, verdict} via
+    cv.verdict_from_gap()."""
 
-def evaluate_model(model_id: str, split_id: str) -> dict:
-    """Loads fitted pipeline+model, predicts on test split, returns
-    {accuracy, precision, recall, f1, roc_auc, confusion_matrix}."""
+def regularization_path_search(folds_id: str, pipeline_spec_id: str, model_family: str = "linear", alpha_grid: list[float] = None) -> dict:
+    """Only meaningful for model_family='linear'. Runs
+    cross_validate_model once per alpha in alpha_grid (a sensible default
+    if omitted), picks the alpha with the best mean CV score. Called when
+    diagnose_fit returns verdict='overfitting' on a linear model. Returns
+    {best_alpha, cv_score_per_alpha}."""
 
-def cross_validate_model(dataset_id: str, pipeline_id: str, model_type: str,
-                          hyperparams: dict | None = None, cv_folds: int = 5) -> dict:
-    """sklearn.model_selection.cross_validate with StratifiedKFold. Used
-    only on the final chosen model, not every candidate."""
+def handle_class_imbalance(split_id: str, target_column: str, strategy: str = "auto", severity_threshold: float = None) -> dict:
+    """strategy='auto' checks imbalance.detect_severity_ratio() against
+    severity_threshold. Returns imbalance_spec -- a recipe, not a
+    resampled dataset: the actual resampling (SMOTE, undersampling, or
+    just class_weight) gets applied inside each fold's training data only,
+    inside cross_validate_model, never before folding."""
 
-def predict(model_id: str, rows: list[dict]) -> dict:
-    """Loads fitted pipeline+model, wraps rows in a one-row DataFrame per
-    call, returns predictions + probabilities. Used by the Gradio
-    'try it yourself' panel."""
+def calibrate_probabilities(model_id: str, method: str = "platt") -> dict:
+    """Only meaningful post-finalize_model. method in {platt, isotonic}.
+    Returns a NEW calibrated_model_id -- the original model_id is left
+    untouched."""
+
+def tune_decision_threshold(model_id: str, split_id: str, optimize_for: str) -> dict:
+    """Post-finalize_model. Sweeps thresholds against split_id's train
+    partition (not the reserved test partition) to find the one that
+    optimizes optimize_for (f1/precision/recall). Returns
+    {optimal_threshold, metric_at_threshold}."""
+
+def explain_predictions(model_id: str, split_id: str, top_n: int) -> dict:
+    """Post-finalize_model, read-only. model_family='linear' returns
+    coefficients directly; 'tree_ensemble' returns permutation importance
+    (more reliable than built-in impurity importance when features are
+    correlated). Also returns top_n example predictions with inputs."""
+
+def analyze_prediction_errors(model_id: str, split_id: str, segment_by: list[str] = None) -> dict:
+    """Post-finalize_model. Breaks the error rate down by feature-value
+    bucket for each column in segment_by (auto-selected via
+    interpretation.auto_select_segment_columns() if omitted). This is
+    where 'fine overall, bad for tenure < 3 months' surfaces --
+    explain_predictions only shows the aggregate view."""
+
+def finalize_model(folds_id: str, pipeline_spec_id: str, model_family: str, hyperparams: dict = None) -> dict:
+    """THE ONLY tool that produces a persisted, reusable fitted model.
+    Clones pipeline_spec_id once (not per fold) and fits it on the entire
+    train partition. Writes to _cache/models/{model_id}.joblib. folds_id
+    is passed in only to confirm which configuration won, not used for
+    folding here. Returns {model_id}."""
+
+def final_test_evaluation(model_id: str, split_id: str) -> dict:
+    """The only tool permitted to read splits/{split_id}/test.parquet.
+    Checks finalize.check_test_not_already_evaluated() first -- a second
+    call against the same split_id with a DIFFERENT model_id is refused,
+    preventing the finalist from being re-rolled against the same
+    held-out data. Returns {metric: value}."""
