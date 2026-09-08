@@ -160,7 +160,7 @@ def infer_column_roles(dataset_id: str, mode: str = "permissive") -> dict:
         elif series.dtype == object and n_non_null > 0:
             sample = series.dropna().head(min(50, n_non_null))
             try:
-                pd.to_datetime(sample, infer_datetime_format=True)
+                pd.to_datetime(sample, errors="raise")
                 role = "datetime"
                 confidence = "medium"
             except Exception:

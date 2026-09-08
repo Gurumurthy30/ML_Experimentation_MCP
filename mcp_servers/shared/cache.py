@@ -10,10 +10,12 @@ def get_cache_dir() -> Path:
     path (<project_root>/data/_cache), NOT a relative one, so all
     server processes resolve to the same directory regardless of each
     process's working directory at launch time."""
-    default_dir =  "../data/_cache"
-    cache_dir = Path(os.environ.get("TABULARML_CACHE_DIR", default_dir))
+    project_root = Path(__file__).resolve().parent.parent.parent
+    default_dir = project_root / "data" / "_cache"
+    cache_dir = Path(os.environ.get("TABULARML_CACHE_DIR", str(default_dir))).resolve()
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
+
 
 
 def compute_handle_id(*parts) -> str:

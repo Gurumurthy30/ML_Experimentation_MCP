@@ -190,9 +190,14 @@ def _apply_imbalance(X, y, imbalance_spec: dict):
         return X, y
 
     try:
+        min_class_count = int(y.value_counts().min())
+        if min_class_count <= 1:
+            return X, y
+
         if strategy == "oversample_smote":
             from imblearn.over_sampling import SMOTE
-            sm = SMOTE(random_state=42, k_neighbors=min(5, y.value_counts().min() - 1))
+            k_neighbors = max(1, min(5, min_class_count - 1))
+            sm = SMOTE(random_state=42, k_neighbors=k_neighbors)
             X_res, y_res = sm.fit_resample(X, y)
             return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
         elif strategy == "oversample_random":
@@ -205,11 +210,13 @@ def _apply_imbalance(X, y, imbalance_spec: dict):
             rus = RandomUnderSampler(random_state=42)
             X_res, y_res = rus.fit_resample(X, y)
             return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-    except ImportError:
-        # imbalanced-learn not installed; fall back silently
+    except (ImportError, ValueError, Exception):
+        # Fall back to original data if imbalanced-learn is not installed or resampling fails (e.g. non-numeric columns)
         pass
 
     return X, y
+
+
 
 
 def compute_fold_gap(cv_result: dict) -> dict:

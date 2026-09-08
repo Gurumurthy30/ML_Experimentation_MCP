@@ -28,7 +28,7 @@ except ImportError:
 
 def run_python(
     code: str,
-    input_handles: dict[str, str],
+    input_handles: Optional[dict[str, str]] = None,
     timeout_s: int = 60,
 ) -> dict:
     """Execute Python code in an isolated sandbox with handle injection and MCP client tool stubs.

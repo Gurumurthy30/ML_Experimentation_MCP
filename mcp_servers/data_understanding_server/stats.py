@@ -6,27 +6,33 @@ from sklearn.feature_selection import mutual_info_classif, mutual_info_regressio
 def test_normality(series: pd.Series) -> dict:
     """Shapiro-Wilk under 5000 non-null values (its valid range),
     D'Agostino-Pearson above that. Returns {is_normal, statistic,
-    p_value} at alpha=0.05."""
+    p_value} at alpha=0.05. Requires at least 3 non-null samples."""
     series = series.dropna()
+    if len(series) < 3:
+        return {"is_normal": False, "statistic": None, "p_value": None}
     if len(series) < 5000:
         statistic, p_value = stats.shapiro(series)
     else:
         statistic, p_value = stats.normaltest(series)
-    is_normal = p_value > 0.05
-    return {"is_normal": is_normal, "statistic": statistic, "p_value": p_value}
+    is_normal = bool(p_value > 0.05)
+    return {"is_normal": is_normal, "statistic": float(statistic), "p_value": float(p_value)}
 
 def compute_kurtosis(series: pd.Series) -> float:
     """Fisher's definition (normal distribution = 0). Flags heavy-tailed
     columns, which feeds outlier-handling strategy downstream."""
     k = stats.kurtosis(series.dropna(), fisher=True)
-    return k
+    return float(k)
 
-def spearman_correlation(x: pd.Series, y: pd.Series) -> tuple[float, float]:
+def spearman_correlation(x: pd.Series, y: pd.Series) -> dict[str, float]:
     """Rank-based correlation -- catches monotonic-but-non-linear
-    relationships Pearson misses, robust to outliers. Returns
-    (rho, p_value)."""
-    rho, p_value = stats.spearmanr(x.dropna(), y.dropna())
-    return {"rho": rho, "p_value": p_value}
+    relationships Pearson misses, robust to outliers. Aligns non-null pairs
+    and returns {"rho": float, "p_value": float}."""
+    df_aligned = pd.concat([x, y], axis=1).dropna()
+    if len(df_aligned) < 2:
+        return {"rho": 0.0, "p_value": 1.0}
+    rho, p_value = stats.spearmanr(df_aligned.iloc[:, 0], df_aligned.iloc[:, 1])
+    return {"rho": float(rho), "p_value": float(p_value)}
+
 
 def cramers_v(x: pd.Series, y: pd.Series) -> float:
     """Chi-square-based association strength for two categorical columns,
